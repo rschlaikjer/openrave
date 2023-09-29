@@ -3672,6 +3672,29 @@ protected:
 
     mutable std::vector<std::list<UserDataWeakPtr> > _vlistRegisteredCallbacks; ///< callbacks to call when particular properties of the body change. _vlistRegisteredCallbacks[index] is the list of change callbacks where 1<<index is part of KinBodyProperty, this makes it easy to find out if any particular bits have callbacks. The registration/de-registration of the lists can happen at any point and does not modify the kinbody state exposed to the user, hence it is mutable.
 
+    // Since the property callback list is read-heavy, avoid locking/copying in the read path by using a semaphore system.
+    // Whenever a reader wants to execute callbacks, it will perform the following procedure:
+    // start:
+    // - Increment _pListRegisteredCallbacksReaderCount
+    // - Load _pListRegisteredCallbacksForRead
+    // - If _pListRegisteredCallbacksForRead == nullptr:
+    //   - Decrement _pListRegisteredCallbacksReaderCount
+    //   - goto start
+    // - Execute callbacks
+    // - Decrement _pListRegisteredCallbacksReaderCount
+    //
+    // This procedure is lock-free if there is no write contention (_pListRegisteredCallbacksForRead set to null by the writer).
+    // The writer procedure is the following:
+    // start:
+    // - Lock the interface mutex to serialize writes
+    // - Store nullptr into _pListRegisteredCallbacksForRead
+    // - Spin until _pListRegisteredCallbacksReaderCount == 0 -> no readers have a pointer to the data anymore
+    // - Mutate the backing data (_vlistRegisteredCallbacks)
+    // - Write a pointer to _vlistRegisteredCallbacks back to _pListRegisteredCallbacksForRead
+    // - Release interface mutex
+    mutable std::atomic<long> _pListRegisteredCallbacksReaderCount{0};
+    mutable std::atomic<std::vector<std::list<UserDataWeakPtr>>*> _pListRegisteredCallbacksForRead{&_vlistRegisteredCallbacks};
+
     mutable boost::array<std::vector<int>, 4> _vNonAdjacentLinks; ///< contains cached versions of the non-adjacent links depending on values in AdjacentOptions. Declared as mutable since data is cached.
     mutable boost::array<std::set<int>, 4> _cacheSetNonAdjacentLinks; ///< used for caching return value of GetNonAdjacentLinks.
     mutable int _nNonAdjacentLinkCache; ///< specifies what information is currently valid in the AdjacentOptions.  Declared as mutable since data is cached. If 0x80000000 (ie < 0), then everything needs to be recomputed including _setNonAdjacentLinks[0].

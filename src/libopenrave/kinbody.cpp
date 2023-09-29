@@ -73,10 +73,25 @@ public:
     virtual ~ChangeCallbackData() {
         KinBodyConstPtr pbody = _pweakbody.lock();
         if( !!pbody ) {
+            // Lock to ensure that all modifications see each others writes
             std::unique_lock<boost::shared_mutex> lock(pbody->GetInterfaceMutex());
+
+            // Swap the published callback registry pointer with nullptr to block new readers
+            pbody->_pListRegisteredCallbacksForRead.store(nullptr);
+
+            // Spin until there are no readers of the callback list, at which point we know that nobody still has an old pointer to it
+            while (pbody->_pListRegisteredCallbacksReaderCount.load()) {
+            }
+
+            // We are now safe to mutate the actual storage.
+            // Erase our referenced callback from the KinBody
             FOREACH(itinfo, _iterators) {
                 pbody->_vlistRegisteredCallbacks.at(itinfo->first).erase(itinfo->second);
             }
+
+            // Swap the pointer to the registry back into place.
+            // Use release to ensure the change to the backing info is visible in the reader threads.
+            pbody->_pListRegisteredCallbacksForRead.store(&pbody->_vlistRegisteredCallbacks, std::memory_order_release);
         }
     }
 
@@ -5865,23 +5880,48 @@ void KinBody::_PostprocessChangedParameters(uint32_t parameters)
     if( (parameters&Prop_LinkEnable) == Prop_LinkEnable ) {
     }
 
-    std::list<UserDataWeakPtr> listRegisteredCallbacks;
-    uint32_t index = 0;
-    while(parameters && index < _vlistRegisteredCallbacks.size()) {
-        if( (parameters & 1) &&  _vlistRegisteredCallbacks.at(index).size() > 0 ) {
-            {
-                boost::shared_lock< boost::shared_mutex > lock(GetInterfaceMutex());
-                listRegisteredCallbacks = _vlistRegisteredCallbacks.at(index); // copy since it can be changed
+    {
+        // Acquire a valid read pointer to the callback list
+        std::vector<std::list<UserDataWeakPtr>>* callbacks = nullptr;
+        while (true) {
+            // Increment the reader count on the callback list
+            _pListRegisteredCallbacksReaderCount++;
+
+            // Load the current value of the callback registry
+            callbacks = _pListRegisteredCallbacksForRead.load(std::memory_order_acquire);
+
+            // If we got a valid pointer, break
+            if (!!callbacks) {
+                break;
             }
-            FOREACH(it,listRegisteredCallbacks) {
-                ChangeCallbackDataPtr pdata = boost::dynamic_pointer_cast<ChangeCallbackData>(it->lock());
-                if( !!pdata ) {
-                    pdata->_callback();
+
+            // If we didn't, decrement the reader count
+            _pListRegisteredCallbacksReaderCount--;
+
+            // Since we're locked into the slow path at this point, there's no point spinning again until the writer releases their lock.
+            // Block on the interface mutex as a way to get notified when the write is complete.
+            boost::shared_lock<boost::shared_mutex> lock(GetInterfaceMutex());
+        }
+
+        // Iterate and invoke all relevant callbacks.
+        uint32_t index = 0;
+        while (parameters && index < callbacks->size()) {
+            // Did we actually change this parameter?
+            if (parameters & 1) {
+                // If we did, iterate and invoke all the relevant callbacks
+                for (UserDataWeakPtr& weakData : callbacks->at(index)) {
+                    ChangeCallbackDataPtr pdata = boost::dynamic_pointer_cast<ChangeCallbackData>(weakData.lock());
+                    if (!!pdata) {
+                        pdata->_callback();
+                    }
                 }
             }
+            parameters >>= 1;
+            index += 1;
         }
-        parameters >>= 1;
-        index += 1;
+
+        // When we're done, decrement the reader count
+        _pListRegisteredCallbacksReaderCount--;
     }
 }
 
@@ -5984,15 +6024,25 @@ ConfigurationSpecification KinBody::GetConfigurationSpecificationIndices(const s
 UserDataPtr KinBody::RegisterChangeCallback(uint32_t properties, const boost::function<void()>&callback) const
 {
     ChangeCallbackDataPtr pdata(new ChangeCallbackData(properties,callback,shared_kinbody_const()));
+
+    // Lock to ensure that all modifications see each others writes
     std::unique_lock<boost::shared_mutex> lock(GetInterfaceMutex());
 
+    // Swap the published callback registry pointer with nullptr to block new readers
+    _pListRegisteredCallbacksForRead.store(nullptr);
+
+    // Spin until there are no readers of the callback list, at which point we know that nobody still has an old pointer to it
+    while (_pListRegisteredCallbacksReaderCount.load()) {
+    }
+
+    // We are now safe to mutate the actual storage.
     uint32_t index = 0;
-    while(properties) {
-        if( properties & 1 ) {
-            if( index >= _vlistRegisteredCallbacks.size() ) {
+    while (properties) {
+        if (properties & 1) {
+            if (index >= _vlistRegisteredCallbacks.size()) {
                 // have to resize _vlistRegisteredCallbacks, but have to preserve the internal lists since ChangeCallbackData keep track of the list iterators
-                std::vector<std::list<UserDataWeakPtr> > vlistRegisteredCallbacks(index+1);
-                for(size_t i = 0; i < _vlistRegisteredCallbacks.size(); ++i) {
+                std::vector<std::list<UserDataWeakPtr>> vlistRegisteredCallbacks(index + 1);
+                for (size_t i = 0; i < _vlistRegisteredCallbacks.size(); ++i) {
                     vlistRegisteredCallbacks[i].swap(_vlistRegisteredCallbacks[i]);
                 }
                 _vlistRegisteredCallbacks.swap(vlistRegisteredCallbacks);
@@ -6002,6 +6052,11 @@ UserDataPtr KinBody::RegisterChangeCallback(uint32_t properties, const boost::fu
         properties >>= 1;
         index += 1;
     }
+
+    // Swap the pointer to the registry back into place.
+    // Use release to ensure the change to the backing info is visible in the reader threads.
+    _pListRegisteredCallbacksForRead.store(&_vlistRegisteredCallbacks, std::memory_order_release);
+
     return pdata;
 }
 

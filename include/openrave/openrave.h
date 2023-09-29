@@ -48,6 +48,7 @@
 #else
 #endif
 
+#include <atomic>
 #include <string>
 #include <vector>
 #include <list>
